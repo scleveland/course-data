@@ -315,7 +315,7 @@ class GeminiCourseExtractor:
         else:
             self.current_institution = 'Unknown Institution'
 
-def process_pdfs_with_gemini(project_id: str, keyfile_path: str, catalogs_dir: str, output_dir: str):
+def process_pdfs_with_gemini(project_id: str, keyfile_path: str, catalogs_dir: str, output_dir: str, max_workers: int = 20):
     """Process all PDFs in the catalogs directory using Gemini."""
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -333,7 +333,7 @@ def process_pdfs_with_gemini(project_id: str, keyfile_path: str, catalogs_dir: s
             
             try:
                 # Process the PDF and extract courses
-                courses = extractor.process_pdf(filepath)
+                courses = extractor.process_pdf(filepath, max_workers=max_workers)
                 if courses:
                     all_courses.extend(courses)
                     print(f"Extracted {len(courses)} courses from {filename}")
@@ -380,7 +380,8 @@ if __name__ == "__main__":
             project_id=GOOGLE_CLOUD_PROJECT,
             keyfile_path=keyfile_path,
             catalogs_dir=CATALOGS_DIR,
-            output_dir=OUTPUT_DIR
+            output_dir=OUTPUT_DIR,
+            max_workers=20
         )
     except Exception as e:
         print(f"An error occurred: {e}")
