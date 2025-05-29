@@ -1,0 +1,4 @@
+/.venv
+/keyfile.json
+/main.py
+/requirements.txt
