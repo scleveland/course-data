@@ -116,18 +116,37 @@ class GeminiCourseExtractor:
         filename = os.path.basename(filepath)
         print(f"Processing: {filename}")
         
-        # Read the entire PDF with retry
+        # Read the entire PDF with retry and proper resource management
         def _read_pdf() -> str:
-            text = ""
             try:
+                print(f"  - Opening PDF file: {filepath}")
                 with open(filepath, 'rb') as file:
                     reader = PyPDF2.PdfReader(file)
-                    for page in reader.pages:
-                        text += page.extract_text() + "\n"
-                return text
+                    total_pages = len(reader.pages)
+                    print(f"  - Processing {total_pages} pages...")
+                    
+                    # Use a list to collect page texts and join at the end
+                    page_texts = []
+                    for i, page in enumerate(reader.pages, 1):
+                        if i % 10 == 0 or i == 1 or i == total_pages:
+                            print(f"  - Extracting text from page {i}/{total_pages}")
+                        page_text = page.extract_text()
+                        if page_text:  # Only add non-empty texts
+                            page_texts.append(page_text)
+                    
+                    total_text = '\n'.join(page_texts)
+                    print(f"  - Extracted {len(total_text):,} characters from {total_pages} pages")
+                    return total_text
+                    
             except Exception as e:
                 print(f"Error reading PDF: {e}")
                 return ""
+            finally:
+                # Ensure any resources are released
+                if 'reader' in locals():
+                    if hasattr(reader, '_stream') and reader._stream:
+                        reader._stream.close()
+                    print("  - Closed PDF file")
         
         text = self.retry_with_backoff(_read_pdf, max_retries=3, initial_delay=1.0)
             
@@ -135,18 +154,67 @@ class GeminiCourseExtractor:
             print(f"Warning: Could not extract text from {filepath}")
             return []
             
-        # Split text into chunks with overlap to prevent splitting courses
-        chunk_size = 10000  # Smaller chunks for better parallelization
-        overlap = 1000  # Overlap to prevent splitting courses
+        # Process text in chunks to avoid memory issues
+        chunk_size = 10000  # Target chunk size
+        min_chunk_size = 1000  # Minimum chunk size to ensure progress
+        overlap = 1000  # 1K character overlap to prevent splitting courses
         chunks = []
         start = 0
         chunk_num = 1
+        total_chars = len(text)
         
-        while start < len(text):
-            end = min(start + chunk_size, len(text))
-            chunks.append((chunk_num, text[start:end], filename))
-            start = end - overlap  # Overlap with next chunk
+        print(f"  - Splitting {total_chars:,} characters into chunks...")
+        
+        while start < total_chars:
+            # Calculate end position for this chunk
+            end = min(start + chunk_size, total_chars)
+            
+            # If this would be the last chunk and it's too small, just extend it to the end
+            if end == total_chars and (end - start) < min_chunk_size and len(chunks) > 0:
+                # Merge with previous chunk if possible
+                prev_chunk_num, prev_chunk, _ = chunks[-1]
+                chunks[-1] = (prev_chunk_num, prev_chunk + text[start:end], filename)
+                print(f"  - Merged final small chunk ({end-start:,} chars) with previous chunk")
+                break
+            
+            # Add the chunk if it's not empty
+            if start < end:
+                chunk_text = text[start:end]
+                chunks.append((chunk_num, chunk_text, filename))
+                
+                # Calculate and log progress
+                progress = min(100, int((end / total_chars) * 100))
+                print(f"  - Created chunk {chunk_num}: positions {start:,}-{end:,} "
+                      f"({len(chunk_text):,} chars, {progress}% of text)")
+            
+            # Calculate next start position (move forward by chunk_size - overlap)
+            new_start = start + chunk_size - overlap
+            
+            # If we're at or beyond the end, we're done
+            if new_start >= total_chars:
+                break
+                
+            # Ensure we're making progress
+            if new_start <= start:
+                new_start = start + 1
+                if new_start >= total_chars:
+                    break
+            
+            # Update for next iteration
+            start = new_start
             chunk_num += 1
+            
+            # Force garbage collection every 10 chunks to help with memory
+            if chunk_num % 10 == 0:
+                import gc
+                gc.collect()
+                
+            # Safety check to prevent infinite loops
+            if chunk_num > 1000:  # Arbitrary large number to prevent infinite loops
+                print(f"  - Warning: Exceeded maximum number of chunks (1000). Stopping chunking.")
+                break
+                
+        print(f"  - Split into {len(chunks)} chunks for processing")
         
         all_courses = []
         completed_chunks = set()
@@ -163,32 +231,67 @@ class GeminiCourseExtractor:
                 time.sleep(0.5)
             
             # Process results as they complete
+            start_time = time.time()
+            last_update = start_time
+            
+            print(f"\n  --- Starting parallel processing of {len(chunks)} chunks with {max_workers} workers ---")
+            
             for future in concurrent.futures.as_completed(future_to_chunk):
                 chunk_num = future_to_chunk[future]
+                current_time = time.time()
+                
                 try:
                     chunk_num, chunk_courses = future.result()
                     if chunk_courses:
                         all_courses.extend(chunk_courses)
                     completed_chunks.add(chunk_num)
-                    print(f"Completed {len(completed_chunks)}/{len(chunks)} chunks")
+                    
+                    # Calculate progress and ETA
+                    elapsed = current_time - start_time
+                    chunks_remaining = len(chunks) - len(completed_chunks)
+                    chunks_per_sec = len(completed_chunks) / (elapsed + 1e-6)
+                    eta = chunks_remaining / (chunks_per_sec + 1e-6)
+                    
+                    # Only log every 5 chunks or if it's been more than 5 seconds since last update
+                    if (len(completed_chunks) % 5 == 0 or 
+                        current_time - last_update > 5 or 
+                        len(completed_chunks) == len(chunks)):
+                        print(
+                            f"  - Processed chunk {len(completed_chunks)}/{len(chunks)} | "
+                            f"{len(chunk_courses)} courses | "
+                            f"ETA: {int(eta//60)}m {int(eta%60)}s"
+                        )
+                        last_update = current_time
+                        
                 except Exception as e:
                     print(f"Error processing chunk {chunk_num} after submission: {e}")
         
-        print(f"Completed processing {filename}. Extracted {len(all_courses)} courses.")
+        total_time = time.time() - start_time
+        print(f"\n  --- Completed processing {filename} in {total_time:.1f} seconds ---")
+        print(f"  - Extracted {len(all_courses)} courses from {len(chunks)} chunks")
+        print(f"  - Average processing time: {total_time/len(chunks):.2f} seconds per chunk")
         return all_courses
     
     def read_entire_pdf(self, filepath: str) -> str:
-        """Read the entire PDF file and return its text content."""
-        text = ""
+        """Read the entire PDF file and return its text content with proper resource management."""
         try:
             with open(filepath, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
+                # Use a list to collect page texts and join at the end
+                page_texts = []
                 for page in reader.pages:
-                    text += page.extract_text() + "\n"
-            return text
+                    page_text = page.extract_text()
+                    if page_text:  # Only add non-empty texts
+                        page_texts.append(page_text)
+                return '\n'.join(page_texts)
         except Exception as e:
             print(f"Error reading PDF: {e}")
             return ""
+        finally:
+            # Ensure any resources are released
+            if 'reader' in locals():
+                if hasattr(reader, '_stream') and reader._stream:
+                    reader._stream.close()
 
     def extract_courses_with_gemini(self, text: str, filename: str) -> List[Dict]:
         """Use Gemini to extract course information from text."""
@@ -381,7 +484,7 @@ if __name__ == "__main__":
             keyfile_path=keyfile_path,
             catalogs_dir=CATALOGS_DIR,
             output_dir=OUTPUT_DIR,
-            max_workers=20
+            max_workers=100
         )
     except Exception as e:
         print(f"An error occurred: {e}")
