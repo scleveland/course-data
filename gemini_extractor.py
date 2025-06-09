@@ -5,7 +5,7 @@ import random
 import concurrent.futures
 from typing import List, Dict, Optional, Tuple, Type, Any, Callable
 import PyPDF2
-from vertexai.preview.generative_models import GenerativeModel
+from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 import vertexai
 from google.api_core import exceptions as google_exceptions
 from google.oauth2 import service_account
@@ -111,6 +111,150 @@ class GeminiCourseExtractor:
             print(f"Error in chunk {chunk_num} after retries: {e}")
             return (chunk_num, [])
 
+    def find_course_section_start(self, reader: PyPDF2.PdfReader, max_toc_pages: int = 20) -> int:
+        """Analyze the PDF to find the starting page of the course section using Gemini.
+        
+        Args:
+            reader: PyPDF2 PdfReader instance
+            max_toc_pages: Maximum number of pages to check for table of contents
+            
+        Returns:
+            int: 1-based page number where course section starts, or 1 if not found
+        """
+        print("  - Searching for course section using Gemini...")
+        
+        # First, find a proper table of contents page
+        toc_page_num = None
+        max_pages_to_scan = min(30, len(reader.pages))  # Scan at most 30 pages
+        
+        # Phase 1: Find the table of contents using Gemini
+        for page_num in range(max_pages_to_scan):
+            try:
+                page = reader.pages[page_num]
+                text = page.extract_text()
+                print(f"  - Analyzing page {page_num + 1} with Gemini... {text[:100]}")
+                # Skip empty or very short pages
+                if not text or len(text.strip()) < 20:
+                    continue
+                
+                # Use Gemini to determine if this is a TOC page
+                prompt = f"""Analyze if this page is a table of contents or contents page from a university course catalog.
+                A table of contents or contents page typically contains a list of sections and page numbers. Sections may be names General Information, Courses and others that makes sense in the context of an academic institutions catalog.
+                
+                Page content:
+                {text}...
+                
+                Is this a table of contents page? Answer with exactly 'yes' or 'no'."""
+                
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config={
+                        "max_output_tokens": 65000,
+                        "temperature": 0.0
+                    }
+                    # },
+                    # safety_settings={
+                    #     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    #     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    #     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    #     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                    # }
+                )
+                
+                if response and hasattr(response, 'text'):
+                    if response.text.strip().lower().startswith('yes'):
+                        toc_page_num = page_num + 1  # Store 1-based page number
+                        print(f"  - Gemini identified page {toc_page_num} as a table of contents")
+                        break
+                    
+            except Exception as e:
+                print(f"  - Error reading page {page_num + 1}: {e}")
+        
+        # Phase 2: Look for course listings starting from the TOC page
+        if toc_page_num is not None:
+            # Search up to 10 pages after the TOC
+            end_page = min(toc_page_num + 10, len(reader.pages))
+            for page_num in range(toc_page_num - 1, end_page):  # Convert back to 0-based
+                try:
+                    page = reader.pages[page_num]
+                    text = page.extract_text()
+                    
+                    print(f"  - Analyzing TOC on page {page_num} with Gemini...{text}")
+                    # Prepare the prompt with clear instructions
+                    prompt_text = f"""You are analyzing a university course catalog's table of contents.
+                    Your task is to find the page number where the actual course listings begin.
+                    Look for sections like 'Course Descriptions', 'Courses', 'Course Catalog', etc.  Then if there is no page number look if there are subsections like overview or description etc and use the first subsection's page number.
+                    
+                    Return ONLY the page number as an integer, or 'null' if you can't find any course listing information in this TOC.
+                    
+                    Table of Contents:
+                    {text}
+                    
+                    Page number where course listings begin (or 'null' if not found):"""
+                    
+                    # Send to Gemini with safety settings
+                    response = self.model.generate_content(
+                        prompt_text,
+                        generation_config={
+                            "max_output_tokens": 65000,  # We only need a number
+                            "temperature": 0.0,  # Be deterministic
+                        },
+                        safety_settings={
+                            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                        }
+                    )
+                
+                    # Safely extract the response text
+                    if response and hasattr(response, 'text'):
+                        result = response.text.strip()
+                        # Clean the result to get just the first number
+                        import re
+                        match = re.search(r'\d+', result)
+                        if match:
+                            page_num = int(match.group())
+                            if 1 <= page_num <= len(reader.pages):
+                                print(f"  - Gemini suggests starting at page {page_num}")
+                                return page_num
+                            else:
+                                print(f"  - Gemini returned out-of-range page number: {page_num}")
+                        else:
+                            print(f"  - No page number found in Gemini response")
+                    else:
+                        print("  - Empty or invalid response from Gemini")
+                    
+                except Exception as e:
+                    print(f"  - Error processing Gemini response: {str(e)}")
+            
+            # If we get here, we didn't find course listings but have a TOC page
+            return toc_page_num
+                        
+        
+
+        
+    def _extract_page_number(self, line: str) -> int:
+        """Extract page number from a TOC line."""
+        # Handle different TOC formats:
+        # 1. "Courses ................ 123"
+        # 2. "Courses 123"
+        # 3. "123 Courses"
+        # 4. "Courses" (on one line) followed by "123" (on next line)
+        
+        # Remove any non-alphanumeric characters except spaces and dots
+        clean_line = ''.join(c if c.isalnum() or c in ' .' else ' ' for c in line)
+        
+        # Look for numbers in the line
+        parts = clean_line.split()
+        for part in reversed(parts):  # Check from right to left
+            if part.isdigit():
+                page_num = int(part)
+                if 1 <= page_num <= 1000:  # Reasonable page number range
+                    return page_num
+        
+        return None
+
     def process_pdf(self, filepath: str, max_workers: int = 4) -> List[Dict]:
         """Process a single PDF file and return extracted courses using parallel processing."""
         filename = os.path.basename(filepath)
@@ -123,19 +267,23 @@ class GeminiCourseExtractor:
                 with open(filepath, 'rb') as file:
                     reader = PyPDF2.PdfReader(file)
                     total_pages = len(reader.pages)
-                    print(f"  - Processing {total_pages} pages...")
+                    
+                    # Find the starting page for course section
+                    start_page = self.find_course_section_start(reader)
+                    print(f"  - Processing pages {start_page} to {total_pages} of {total_pages}...")
                     
                     # Use a list to collect page texts and join at the end
                     page_texts = []
-                    for i, page in enumerate(reader.pages, 1):
-                        if i % 10 == 0 or i == 1 or i == total_pages:
-                            print(f"  - Extracting text from page {i}/{total_pages}")
+                    for i in range(start_page - 1, total_pages):  # Convert to 0-based index
+                        page = reader.pages[i]
+                        if (i - start_page + 1) % 10 == 0 or i == start_page - 1 or i == total_pages - 1:
+                            print(f"  - Extracting text from page {i + 1}/{total_pages}")
                         page_text = page.extract_text()
                         if page_text:  # Only add non-empty texts
                             page_texts.append(page_text)
                     
                     total_text = '\n'.join(page_texts)
-                    print(f"  - Extracted {len(total_text):,} characters from {total_pages} pages")
+                    print(f"  - Extracted {len(total_text):,} characters from {total_pages - start_page + 1} pages")
                     return total_text
                     
             except Exception as e:
