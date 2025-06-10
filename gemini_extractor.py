@@ -499,7 +499,7 @@ class GeminiCourseExtractor:
         
         try:
             # Limit text size to avoid context window issues
-            content = text[:8000]
+            content = text
             
             # Create the full prompt
             full_prompt = prompt + content
